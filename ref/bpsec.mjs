@@ -1,0 +1,147 @@
+// BPSec (RFC 9172) Block Integrity Block with the BIB-HMAC-SHA2 security context
+// (RFC 9173 section 3, context id 1): build and verify a BIB over chosen target blocks.
+// Checked byte for byte against RFC 9173 Appendix A.1 (ref/selftest_bpsec.mjs).
+//
+// Used here to check that relays carry BIBs so that they still verify at the far end.
+import { createHmac, createDecipheriv, timingSafeEqual } from "node:crypto";
+import { encode, decodeAt, bstr } from "./cbor.mjs";
+import { encodeBundle, encodeEid, decodeEid, sealBlock, BLOCK, CRC_NONE, nextBlockNumber } from "./bundle.mjs";
+
+export const SC_BIB_HMAC_SHA2 = 1;
+export const SHA = { HMAC256: 5, HMAC384: 6, HMAC512: 7 };
+const HASH = { 5: "sha256", 6: "sha384", 7: "sha512" };
+export const SCOPE = { PRIMARY: 0x1, TARGET_HEADER: 0x2, SECURITY_HEADER: 0x4 };
+const PARAM = { SHA_VARIANT: 1, WRAPPED_KEY: 2, SCOPE_FLAGS: 3 };
+const RESULT_MAC = 1;
+
+// The primary block exactly as it goes on the wire (RFC 9172 section 4: canonical form),
+// CRC included: the first item of the encoded bundle.
+function primaryBytes(bundle) {
+  const all = encodeBundle(bundle);
+  return all.subarray(1, decodeAt(all, 1).end);
+}
+
+const uints = (...ns) => Buffer.concat(ns.map((n) => encode(n)));
+
+// Integrity-protected plaintext, RFC 9173 section 3.7. Any target other than the primary
+// block contributes its block-type-specific data as a CBOR byte string. When the target is the
+// primary block, steps 2 and 3 are skipped and the canonical primary block is appended BARE:
+// RFC 9172 section 4 forbids any encapsulating CBOR encoding. The published Appendix A.3 vector
+// wraps it in a byte string, which RFC 9173 erratum 9192 (reported 2026-09-28) corrects; sign
+// emits only the normative form, and verify falls back to the A.3 form (option a3Primary,
+// on by default during the transition, as Hardy does) so BIBs from implementations that copied
+// A.3 still verify.
+//
+// mode "ion": JPL ION (c5a4d87, bpv7/bpsec/utils/bpsec_util.c canonicalizePayloadBlock)
+// appends the whole serialized target block instead (header with flags 0, data, CRC),
+// so its MACs differ from RFC 9173 for every non-primary target (confirmed against ION
+// on 2026-10-18); kept only to interoperate with ION.
+export const IPPT_MODE = { RFC9173: "rfc9173", ION: "ion" };
+export function ippt(bundle, target, bib, scope, mode = IPPT_MODE.RFC9173, { a3Primary = false } = {}) {
+  const parts = [encode(scope & 0x7)];
+  const isPrimary = target.number === 0;
+  if (!isPrimary && scope & SCOPE.PRIMARY) parts.push(primaryBytes(bundle));
+  if (!isPrimary && scope & SCOPE.TARGET_HEADER) parts.push(uints(target.type, target.number, target.flags ?? 0));
+  if (scope & SCOPE.SECURITY_HEADER) parts.push(uints(BLOCK.BIB, bib.number, bib.flags ?? 0));
+  if (mode === IPPT_MODE.ION && !isPrimary) {
+    parts.push(sealBlock([target.type, target.number, 0, target.crcType ?? CRC_NONE, bstr(target.data)], target.crcType ?? CRC_NONE));
+  } else {
+    parts.push(isPrimary ? (a3Primary ? encode(bstr(primaryBytes(bundle))) : primaryBytes(bundle)) : encode(bstr(target.data)));
+  }
+  return Buffer.concat(parts);
+}
+
+const mac = (variant, key, data) => createHmac(HASH[variant], key).update(data).digest();
+
+// RFC 9173 section 3.3.2: a BIB may carry its HMAC key wrapped (AES Key Wrap, RFC 3394)
+// under the shared long-term key; JPL ION does this when it signs. Unwrap with the
+// long-term key; a wrong key fails the RFC 3394 integrity check and throws.
+export function unwrapKey(kek, wrapped) {
+  const alg = { 16: "id-aes128-wrap", 24: "id-aes192-wrap", 32: "id-aes256-wrap" }[kek.length];
+  if (!alg) throw new Error(`no AES key wrap for a ${kek.length}-byte key`);
+  const d = createDecipheriv(alg, kek, Buffer.from("A6A6A6A6A6A6A6A6", "hex"));
+  return Buffer.concat([d.update(Buffer.from(wrapped)), d.final()]);
+}
+
+// Add a BIB over `targets` (block numbers; 0 = primary). Returns a new bundle object.
+// RFC 9173 section 3.8.1: a target's CRC MUST be removed before the IPPT is computed (the
+// BIB now protects it); Hardy refuses a bundle whose BIB target still carries one.
+export function addBib(bundle0, { targets, key, source, shaVariant = SHA.HMAC256, scope = 0x7, flags = 0, crcType = CRC_NONE, number, mode = IPPT_MODE.RFC9173 }) {
+  if (!HASH[shaVariant]) throw new Error(`unknown SHA variant ${shaVariant}`);
+  const bundle = {
+    primary: targets.includes(0) ? { ...bundle0.primary, crcType: CRC_NONE } : bundle0.primary,
+    blocks: bundle0.blocks.map((b) => (targets.includes(b.number) ? { ...b, crcType: CRC_NONE } : b)),
+  };
+  const bibNumber = number ?? nextBlockNumber(bundle);
+  const bib = { number: bibNumber, flags };
+  const results = targets.map((n) => {
+    const t = n === 0 ? { number: 0 } : bundle.blocks.find((b) => b.number === n);
+    if (!t) throw new Error(`no block ${n} to target`);
+    if (t.type === BLOCK.BIB || t.type === BLOCK.BCB) throw new Error("a BIB must not target a security block");
+    return [[RESULT_MAC, bstr(mac(shaVariant, key, ippt(bundle, t, bib, scope, mode)))]];
+  });
+  const asb = Buffer.concat([
+    encode(targets), encode(SC_BIB_HMAC_SHA2), encode(1), encode(encodeEid(source)),
+    encode([[PARAM.SHA_VARIANT, shaVariant], [PARAM.SCOPE_FLAGS, scope]]),
+    encode(results),
+  ]);
+  const blocks = [...bundle.blocks];
+  const payload = blocks.pop();
+  return { ...bundle, blocks: [...blocks, { type: BLOCK.BIB, number: bibNumber, flags, crcType, data: asb }, payload] };
+}
+
+// Parse a BIB's abstract security block (RFC 9172 section 3.6: a CBOR sequence).
+export function parseAsb(data) {
+  let off = 0;
+  const next = () => { const r = decodeAt(data, off); off = r.end; return r.value; };
+  const targets = next(), contextId = next(), contextFlags = next(), source = decodeEid(next());
+  const params = contextFlags & 1 ? new Map(next().map(([k, v]) => [k, v])) : new Map();
+  const results = next();
+  if (off !== data.length) throw new Error("trailing bytes in security block");
+  return { targets, contextId, contextFlags, source, params, results };
+}
+
+// Verify every BIB in the bundle with `key`. { ok, bibs: [{ number, source, targets }] }
+// or { ok:false, reason, ... }. mode "ion" verifies a BIB made by JPL ION, which also
+// keeps the target's CRC, so that check is relaxed in that mode only.
+export function verifyBibs(bundle, key, { mode = IPPT_MODE.RFC9173, a3Primary = true } = {}) {
+  const bibs = bundle.blocks.filter((b) => b.type === BLOCK.BIB);
+  if (!bibs.length) return { ok: false, reason: "no_bib" };
+  const out = [];
+  let a3Fallbacks = 0; // BIBs over the primary block that verified only in the pre-erratum A.3 form
+  for (const b of bibs) {
+    let asb;
+    try { asb = parseAsb(b.data); } catch (e) { return { ok: false, reason: "bib_malformed", detail: e.message }; }
+    if (asb.contextId !== SC_BIB_HMAC_SHA2) return { ok: false, reason: "unsupported_security_context", context: asb.contextId };
+    // RFC 9173 section 3.3.1: the default SHA variant is HMAC 384/384. ION signs with
+    // HMAC 256/256 and omits the parameter, so in ion mode its default is used.
+    const variant = asb.params.get(PARAM.SHA_VARIANT) ?? (mode === IPPT_MODE.ION ? SHA.HMAC256 : SHA.HMAC384);
+    const scope = asb.params.get(PARAM.SCOPE_FLAGS) ?? 0x7;
+    let macKey = key;
+    if (asb.params.has(PARAM.WRAPPED_KEY)) {
+      try { macKey = unwrapKey(key, asb.params.get(PARAM.WRAPPED_KEY)); } catch { return { ok: false, reason: "key_unwrap_failed", bib: b.number }; }
+    }
+    for (let i = 0; i < asb.targets.length; i++) {
+      const n = asb.targets[i];
+      const t = n === 0 ? { number: 0 } : bundle.blocks.find((x) => x.number === n);
+      if (!t) return { ok: false, reason: "target_missing", bib: b.number, target: n };
+      if (mode !== IPPT_MODE.ION && (n === 0 ? bundle.primary.crcType : t.crcType) !== CRC_NONE) {
+        return { ok: false, reason: "target_has_crc", bib: b.number, target: n }; // RFC 9173 3.8.1
+      }
+      const r = (asb.results[i] || []).find(([id]) => id === RESULT_MAC);
+      if (!r) return { ok: false, reason: "no_mac_result", bib: b.number, target: n };
+      const got = Buffer.from(r[1]);
+      const same = (w) => got.length === w.length && timingSafeEqual(got, w);
+      let okMac = same(mac(variant, macKey, ippt(bundle, t, b, scope, mode)));
+      if (!okMac && n === 0 && a3Primary) {
+        okMac = same(mac(variant, macKey, ippt(bundle, t, b, scope, mode, { a3Primary: true })));
+        if (okMac) a3Fallbacks++;
+      }
+      if (!okMac) {
+        return { ok: false, reason: "mac_mismatch", bib: b.number, target: n };
+      }
+    }
+    out.push({ number: b.number, source: asb.source, targets: asb.targets });
+  }
+  return { ok: true, bibs: out, ...(a3Fallbacks ? { a3PrimaryFallback: a3Fallbacks } : {}) };
+}
