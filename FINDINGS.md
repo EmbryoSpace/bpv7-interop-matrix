@@ -80,7 +80,8 @@ Three cases carry a Block Integrity Block (RFC 9172) with the BIB-HMAC-SHA2 cont
     waypoint node"), so `primeBibcheck` is never set; the later check for a primary block
     with neither a CRC nor a BIB then marks the bundle inauthentic, and it is discarded
     ("No primary block BIB or primary block CRC."). The rule-less path for a non-waypoint
-    sets `primeBibcheck`; the waypoint path does not.
+    sets `primeBibcheck`; the waypoint path does not. Reported:
+    [nasa-jpl/ION-DTN#139](https://github.com/nasa-jpl/ION-DTN/issues/139).
   - **bplib** (7.0.5, `bplib_cbor_decode_primary.c`): rejects a primary block with CRC type
     0. Documented in the code: security blocks are not supported yet.
 
