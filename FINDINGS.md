@@ -1,11 +1,12 @@
 # Findings
 
 From the run of 2026-10-27 ([results/MATRIX.md](results/MATRIX.md)): 7 single relays and 32
-relay pairs across 6 implementations and 7 convergence layers.
+relay pairs across 6 implementations and 7 convergence layers, 12 test cases each.
 
 **Overall:** every pair that shares a convergence layer forwards bundles for the other.
-Payloads, both CRC types, large bundles, hop count, unknown extension blocks and the
-Previous Node block all come through correctly in every delivered run. The differences are
+Payloads, both CRC types, large bundles, hop count, unknown extension blocks, the
+Previous Node block and BPSec integrity blocks over the payload all come through correctly
+in every delivered run. The differences are
 in the details below.
 
 ## 1. HDTN keeps unknown blocks flagged "discard" (single relay)
@@ -34,7 +35,8 @@ Bundle Age block by the time it held the bundle (RFC 9171 sections 4.4.2 and 5.4
 most runs the age arrives unchanged, which is reported as a warning: a relay that holds a
 bundle for under a millisecond can correctly add 0.
 
-ION and uD3TN add their dwell time in code, and runs through them show +1 ms. For HDTN no
+ION, uD3TN and dtn7-rs increased it in the single-relay runs (+1 to +2 ms; ION and uD3TN
+add their dwell time in code). HDTN, Hardy and bplib with fixes left it unchanged. For HDTN no
 BPv7 Bundle Age update was found in the code: [nasa/HDTN#80](https://github.com/nasa/HDTN/issues/80).
 A case that makes each relay hold the bundle for a known time would settle the rest.
 
@@ -61,6 +63,47 @@ After the v0.22.0 release commit, `examples/Cargo.toml` still requires `dtn7 = "
 so a fresh clone fails to build. The image here patches the version.
 
 Fix proposed: [dtn7/dtn7-rs#89](https://github.com/dtn7/dtn7-rs/pull/89).
+
+## 7. BPSec: integrity blocks survive relays, except over the primary block in ION and bplib
+
+Three cases carry a Block Integrity Block (RFC 9172) with the BIB-HMAC-SHA2 context
+(RFC 9173), signed with a test key the relays do not have. The sink verifies it.
+
+- **BIB over the payload** (scope 0, and scope 0x7, which also covers the primary block and
+  both block headers): verifies after every relay and every pair that delivers. No relay
+  re-encodes the primary block or changes a block header.
+- **BIB over the primary block**, with the primary block's CRC removed (RFC 9171 section
+  4.3.1 allows CRC type 0 only in that case): HDTN, uD3TN, Hardy and dtn7-rs forward it
+  and it verifies. ION and bplib drop it, so it is lost on every path through either.
+  - **ION** (`bpv7/library/ext/bpsec/bib.c`, `bpsec_verify`): at a waypoint with no
+    policy rule for the BIB, the target is skipped ("Missing rule is not a problem at a
+    waypoint node"), so `primeBibcheck` is never set; the later check for a primary block
+    with neither a CRC nor a BIB then marks the bundle inauthentic, and it is discarded
+    ("No primary block BIB or primary block CRC."). The rule-less path for a non-waypoint
+    sets `primeBibcheck`; the waypoint path does not.
+  - **bplib** (7.0.5, `bplib_cbor_decode_primary.c`): rejects a primary block with CRC type
+    0. Documented in the code: security blocks are not supported yet.
+
+`ref/selftest_bpsec.mjs` checks the signing code against RFC 9173 Appendix A.1 and that a
+changed payload, primary block or block header, or a CRC put back on the primary block,
+fails verification.
+
+## 8. Network management: no common interface
+
+Each implementation has its own management path, found in the shipped code:
+
+| | Management interface |
+| --- | --- |
+| ION | `ionadmin`, `bpadmin` and other admin programs; `nm_agent` and `nm_mgr` for remote network management |
+| HDTN | telemetry and command module (`telem_cmd_interface`) with a websocket server |
+| uD3TN | AAP 2.0 (protobuf): links and forwarding are set by an outside agent over the same interface |
+| Hardy | gRPC between the BPA, its convergence layers and applications; static routes in configuration |
+| dtn7-rs | HTTP web interface and API (`--web-port`, default 3000) |
+| bplib / BPNode | cFS ground commands (contact setup, start, stop) and housekeeping telemetry |
+
+Only ION ships a remote network management agent. Managing a mixed network (a Mars relay
+built from several of these) would need an adapter per implementation, or a common agent
+such as DTNMA (RFC 9675) on each.
 
 ## Notes on the adapters
 

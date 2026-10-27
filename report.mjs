@@ -6,10 +6,11 @@ const files = fs.readdirSync(dir).filter((f) => f.endsWith(".json"));
 const load = (f) => JSON.parse(fs.readFileSync(new URL(f, dir), "utf8"));
 
 const CASES = ["basic", "crc16", "crc32c_payload", "large", "hop_count", "unknown_keep", "unknown_discard",
-  "no_clock_age", "previous_node"];
+  "no_clock_age", "previous_node", "bib_payload", "bib_payload_scoped", "bib_primary"];
 const SHORT = { basic: "basic", crc16: "CRC-16", crc32c_payload: "CRC-32C", large: "large", hop_count: "hop count",
   unknown_keep: "unknown keep", unknown_discard: "unknown discard", no_clock_age: "bundle age",
-  previous_node: "prev node" };
+  previous_node: "prev node", bib_payload: "BIB payload", bib_payload_scoped: "BIB payload+scope",
+  bib_primary: "BIB primary" };
 const MARK = { pass: "✓", warn: "~", fail: "✗", missing: "–" };
 const IMPLS = ["ion", "hdtn", "ud3tn", "hardy", "bplib", "bplib-fixed", "dtn7"];
 const NAME = { ion: "ION", hdtn: "HDTN", ud3tn: "uD3TN", hardy: "Hardy", bplib: "bplib", "bplib-fixed": "bplib + fixes",
@@ -52,13 +53,14 @@ function cell(r) {
   if (st.every((s) => s === "missing")) return "no delivery";
   const ok = st.filter((s) => s === "pass" || s === "warn").length;
   const bad = CASES.flatMap((c, i) => (st[i] === "fail" || st[i] === "missing" ? [`${MARK[st[i]]} ${SHORT[c]}`] : []));
-  return bad.length ? `${ok}/9: ${bad.join(", ")}` : `${ok}/9`;
+  const of = `${ok}/${CASES.length}`;
+  return bad.length ? `${of}: ${bad.join(", ")}` : of;
 }
 
 p("## Pairs");
 p();
 p("Reference source -> X -> Y -> reference sink, with X and Y linked by the named convergence layer.");
-p("Rows are X (sender), columns are Y (receiver). A cell lists the checks that passed out of 9");
+p(`Rows are X (sender), columns are Y (receiver). A cell lists the checks that passed out of ${CASES.length}`);
 p("(warnings count as passed) and names any check that failed or whose bundle did not arrive.");
 for (const cl of cls) {
   const t = pairs.filter((q) => q.cl === cl);

@@ -8,7 +8,7 @@ every convergence layer they share, and checks what comes out the far end.
 reference source --> relay X --(convergence layer)--> relay Y --> reference sink
 ```
 
-The reference source sends nine test bundles; the reference sink decodes everything that
+The reference source sends twelve test bundles; the reference sink decodes everything that
 arrives (CRCs included) and checks each case against RFC 9171:
 
 | Case | The relay must |
@@ -20,6 +20,9 @@ arrives (CRCs included) and checks each case against RFC 9171:
 | unknown discard | remove an unknown block flagged "discard block if it can't be processed" (5.6 step 4) |
 | bundle age | increase the Bundle Age of a bundle without a creation time (4.4.2, 5.4 step 4) |
 | previous node | remove the received Previous Node block, optionally inserting its own (5.4 step 4) |
+| BIB payload | forward a BPSec integrity block over the payload so it still verifies (RFC 9172, 9173) |
+| BIB payload+scope | the same, with the MAC also covering the primary block and both block headers |
+| BIB primary | forward a bundle whose primary block has no CRC and is covered by a BIB (4.3.1) |
 
 A bundle age left unchanged is reported as a warning, not a failure: it can mean the relay
 held the bundle for less than a millisecond.

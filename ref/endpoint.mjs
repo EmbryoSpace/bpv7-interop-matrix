@@ -6,14 +6,21 @@
 //       catches what the last relay forwards and checks each case
 //
 // Every test bundle carries its case name in the payload, so the sink can tell them apart.
+//
+// The bib_* cases carry a BPSec Block Integrity Block (RFC 9172, BIB-HMAC-SHA2 of RFC 9173)
+// signed with a fixed test key. Relays hold no key; they must forward the BIB and its
+// targets so that the BIB still verifies at the sink.
 import fs from "node:fs";
 import crypto from "node:crypto";
 import { send, listen } from "./cl.mjs";
 import { encodeBundle, decodeBundle, encodeEid, decodeEid, CRC_NONE, CRC16, CRC32C, BLOCK, BLOCK_FLAG } from "./bundle.mjs";
 import { encode, decodeAt } from "./cbor.mjs";
+import { addBib, verifyBibs, SHA, SCOPE } from "./bpsec.mjs";
 
 const SRC = "ipn:1.1", DST = "ipn:2.1", LIFETIME = 3_600_000;
 const UNKNOWN_KEEP = 200, UNKNOWN_DISCARD = 201;
+const BIB_KEY = Buffer.from("1a2b1a2b1a2b1a2b1a2b1a2b1a2b1a2b", "hex"); // RFC 9173 Appendix A test key
+const BIB_CASES = ["bib_payload", "bib_payload_scoped", "bib_primary"];
 
 // Deterministic payload: case name, then filler bytes derived from it
 function payload(name, size) {
@@ -46,7 +53,18 @@ function cases(maxBundle) {
       { type: BLOCK.BUNDLE_AGE, number: 2, flags: 0, crcType: CRC_NONE, data: encode(1000) }, P("no_clock_age")] },
     previous_node: { primary: prim(9), blocks: [
       { type: BLOCK.PREVIOUS_NODE, number: 2, flags: 0, crcType: CRC_NONE, data: encode(encodeEid("ipn:1.0")) }, P("previous_node")] },
+    // BIB over the payload, MAC over the payload data only (scope 0)
+    bib_payload: bib(prim(10), "bib_payload", [1], 0),
+    // BIB over the payload, MAC also over the primary block and both block headers (scope 0x7):
+    // breaks if a relay re-encodes the primary block or changes either block's header
+    bib_payload_scoped: bib(prim(11), "bib_payload_scoped", [1], SCOPE.PRIMARY | SCOPE.TARGET_HEADER | SCOPE.SECURITY_HEADER),
+    // BIB over the primary block, whose CRC is then removed (RFC 9171 4.3.1 allows CRC type 0
+    // only when a BIB targets the primary block)
+    bib_primary: bib(prim(12), "bib_primary", [0], 0),
   };
+  function bib(primary, name, targets, scope) {
+    return addBib({ primary, blocks: [P(name)] }, { targets, key: BIB_KEY, source: SRC, shaVariant: SHA.HMAC256, scope });
+  }
 }
 
 // What each case must look like after crossing <relays> relays. Returns a list of problems.
@@ -86,6 +104,14 @@ function check(name, sent, got, relays) {
       // Unchanged can mean a dwell time under 1 ms, so it is a warning, not a failure
       else if (age === 1000) errs.push("WARN bundle age unchanged (dwell under 1 ms, or not updated)");
       else errs.note = `bundle age +${age - 1000} ms`;
+    }
+  }
+  if (BIB_CASES.includes(name)) {
+    const n = got.blocks.filter((b) => b.type === BLOCK.BIB).length;
+    if (n !== 1) errs.push(n ? `${n} BIBs, expected 1` : "BIB removed");
+    else {
+      const v = verifyBibs(got, BIB_KEY, { a3Primary: false });
+      if (!v.ok) errs.push(`BIB does not verify: ${v.reason}${v.target !== undefined ? ` (target ${v.target})` : ""}`);
     }
   }
   if (name === "previous_node") {

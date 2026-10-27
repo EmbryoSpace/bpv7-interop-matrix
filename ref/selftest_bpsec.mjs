@@ -22,3 +22,27 @@ assert.equal(encodeBundle(out).toString("hex"), hex(`9f8807000082028201028202820
   746f2067656e657261746520612033322d62797465207061796c6f6164ff`).toString("hex"), "A.1 final bundle");
 assert.equal(verifyBibs(decodeBundle(encodeBundle(out)), KEY).ok, true, "A.1 verifies");
 console.log("PASS RFC 9173 A.1 byte for byte, and verifies");
+
+// What the relay cases rely on: a change a relay could make breaks verification
+const signed = (targets, scope) => decodeBundle(encodeBundle(addBib(base(), { targets, key: KEY, source: "ipn:2.1", scope })));
+const reason = (b) => verifyBibs(decodeBundle(encodeBundle(b)), KEY, { a3Primary: false }).reason;
+let b = signed([1], 0);
+b.blocks.find((x) => x.type === BLOCK.PAYLOAD).data = Buffer.from("Ready to generate a 32-byte payloaD");
+assert.equal(reason(b), "mac_mismatch", "payload changed");
+b = signed([1], 0);
+b.primary.lifetime += 1;
+assert.equal(verifyBibs(b, KEY).ok, true, "scope 0: primary not covered");
+b = signed([1], 0x7);
+b.primary.lifetime += 1;
+assert.equal(reason(b), "mac_mismatch", "scope 0x7: primary changed");
+b = signed([1], 0x7);
+b.blocks.find((x) => x.type === BLOCK.PAYLOAD).flags = 0x01;
+assert.equal(reason(b), "mac_mismatch", "scope 0x7: target header changed");
+b = signed([0], 0);
+assert.equal(verifyBibs(b, KEY).ok, true, "BIB over the primary block verifies");
+b.primary.crcType = 2;
+assert.equal(reason(b), "target_has_crc", "CRC added back to the primary block");
+b = signed([0], 0);
+b.primary.created = [0, 41];
+assert.equal(reason(b), "mac_mismatch", "primary block changed");
+console.log("PASS changes to signed blocks are detected");
